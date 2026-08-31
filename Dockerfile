@@ -2,7 +2,11 @@
 
 RUN docker-php-ext-install mysqli
 
-RUN a2dismod mpm_event mpm_worker mpm_shared 2>/dev/null || true
+# Remove every MPM that may have been enabled
+RUN rm -f /etc/apache2/mods-enabled/mpm_*.load \
+          /etc/apache2/mods-enabled/mpm_*.conf
+
+# Enable exactly one MPM: prefork
 RUN a2enmod mpm_prefork rewrite
 
 COPY . /var/www/html/
