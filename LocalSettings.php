@@ -31,7 +31,7 @@ $wgSitename = "Udomdejpedia";
 $wgScriptPath = "";
 
 ## The protocol and server name to use in fully-qualified URLs
-$wgServer = "https://wiki-railway-production.up.railway.app";
+$wgServer = "udomdejpedia.org";
 
 ## The URL path to static resources (images, scripts, etc.)
 $wgResourceBasePath = $wgScriptPath;
