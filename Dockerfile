@@ -2,13 +2,21 @@
 
 RUN docker-php-ext-install mysqli
 
-RUN a2dismod mpm_event
-RUN a2enmod mpm_prefork rewrite
+RUN rm -f /etc/apache2/mods-enabled/mpm_event.load \
+          /etc/apache2/mods-enabled/mpm_event.conf \
+          /etc/apache2/mods-enabled/mpm_worker.load \
+          /etc/apache2/mods-enabled/mpm_worker.conf \
+          /etc/apache2/mods-enabled/mpm_prefork.load \
+          /etc/apache2/mods-enabled/mpm_prefork.conf
+
+RUN ln -s ../mods-available/mpm_prefork.load /etc/apache2/mods-enabled/mpm_prefork.load \
+ && ln -s ../mods-available/mpm_prefork.conf /etc/apache2/mods-enabled/mpm_prefork.conf \
+ && a2enmod rewrite
 
 COPY . /var/www/html/
 
 RUN chown -R www-data:www-data /var/www/html
 
-EXPOSE 80
+EXPOSE 8080
 
-CMD ["bash", "-c", "echo '===== MPM FILES ====='; ls -la /etc/apache2/mods-enabled/ | grep mpm || true; echo '===== APACHE MPM ====='; apache2ctl -M 2>&1 | grep mpm || true; echo '===== APACHE CONFIG TEST ====='; apache2ctl -t 2>&1; echo '===== ENV ====='; env | sort; echo '===== KEEPING CONTAINER ALIVE ====='; sleep infinity"]
+CMD ["apache2-foreground"]
