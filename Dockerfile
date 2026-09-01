@@ -2,10 +2,24 @@
 
 RUN docker-php-ext-install mysqli
 
+RUN rm -f /etc/apache2/mods-enabled/mpm_event.load \
+          /etc/apache2/mods-enabled/mpm_event.conf \
+          /etc/apache2/mods-enabled/mpm_worker.load \
+          /etc/apache2/mods-enabled/mpm_worker.conf \
+          /etc/apache2/mods-enabled/mpm_prefork.load \
+          /etc/apache2/mods-enabled/mpm_prefork.conf
+
+RUN ln -s ../mods-available/mpm_prefork.load /etc/apache2/mods-enabled/mpm_prefork.load
+RUN ln -s ../mods-available/mpm_prefork.conf /etc/apache2/mods-enabled/mpm_prefork.conf
+RUN a2enmod rewrite
+
 COPY . /var/www/html/
 
 RUN chown -R www-data:www-data /var/www/html
 
+RUN sed -i 's/Listen 80/Listen 8080/g' /etc/apache2/ports.conf
+RUN sed -i 's/<VirtualHost \*:80>/<VirtualHost *:8080>/g' /etc/apache2/sites-enabled/000-default.conf
+
 EXPOSE 8080
 
-CMD ["bash", "-c", "rm -f /etc/apache2/mods-enabled/mpm_event.load /etc/apache2/mods-enabled/mpm_event.conf /etc/apache2/mods-enabled/mpm_worker.load /etc/apache2/mods-enabled/mpm_worker.conf; a2dismod mpm_event mpm_worker 2>/dev/null || true; a2enmod mpm_prefork rewrite; sed -i 's/Listen 80/Listen 8080/g' /etc/apache2/ports.conf; sed -i 's/<VirtualHost \\*:80>/<VirtualHost *:8080>/g' /etc/apache2/sites-enabled/000-default.conf; apache2ctl -t; echo "===== LISTENING CONFIG ====="; grep -R "Listen " /etc/apache2/ports.conf; echo "===== VIRTUAL HOST ====="; grep -R "VirtualHost" /etc/apache2/sites-enabled/000-default.conf; exec apache2-foreground"]
+CMD ["apache2-foreground"]
