@@ -31,7 +31,7 @@ $wgSitename = "Udomdejpedia";
 $wgScriptPath = "";
 
 ## The protocol and server name to use in fully-qualified URLs
-$wgServer = "https://udomdejpedia.org";
+$wgServer = "udomdejpedia.org";
 
 ## The URL path to static resources (images, scripts, etc.)
 $wgResourceBasePath = $wgScriptPath;
@@ -39,8 +39,8 @@ $wgResourceBasePath = $wgScriptPath;
 ## The URL paths to the logo.  Make sure you change this from the default,
 ## or else you'll overwrite your logo when you upgrade!
 $wgLogos = [
-	'1x' => "https://udomdejpedia.org/images/b/be/UP.png",
-	'icon' => "https://udomdejpedia.org/images/b/be/UP.png",
+	'1x' => "$wgResourceBasePath/resources/assets/change-your-logo.svg",
+	'icon' => "$wgResourceBasePath/resources/assets/change-your-logo-icon.svg",
 ];
 
 ## UPO means: this is also a user preference option
@@ -63,7 +63,7 @@ $wgDBuser = "root";
 $wgDBpassword = "SVkUYejzVCYFXSXffITkPMhijgRfptxo";
 
 # MySQL specific settings
-$wgDBprefix = "";
+$wgDBprefix = "wiki_";
 $wgDBssl = false;
 
 # MySQL table options to use during installation or update
@@ -79,7 +79,7 @@ $wgMemCachedServers = [];
 
 ## To enable image uploads, make sure the 'images' directory
 ## is writable, then set this to true:
-$wgEnableUploads = true;
+$wgEnableUploads = false;
 #$wgUseImageMagick = true;
 #$wgImageMagickConvertCommand = "/usr/bin/convert";
 
@@ -102,14 +102,14 @@ $wgLocaltimezone = "UTC";
 ## be publicly accessible from the web.
 #$wgCacheDirectory = "$IP/cache";
 
-$wgSecretKey = "e02e43be55203aedf01c373f1a723ab6b7dd0f6744b782ee431180f6df8ea9f5";
+$wgSecretKey = "41d1a70ac84787feb742830277aff2d48db82c2245962447e19c216880c1ac23";
 
 # Changing this will log out all existing sessions.
 $wgAuthenticationTokenVersion = "1";
 
 # Site upgrade key. Must be set to a string (default provided) to turn on the
 # web installer while LocalSettings.php is in place
-$wgUpgradeKey = "2df44895d396763c";
+$wgUpgradeKey = "0f2f0ef0805f5dbe";
 
 ## For attaching licensing metadata to pages, and displaying an
 ## appropriate copyright notice / icon. GNU Free Documentation
@@ -120,7 +120,7 @@ $wgRightsText = "";
 $wgRightsIcon = "";
 
 # Path to the GNU diff3 utility. Used for conflict resolution.
-$wgDiff3 = "";
+$wgDiff3 = "/usr/bin/diff3";
 
 ## Default skin: you can change the default skin. Use the internal symbolic
 ## names, e.g. 'vector' or 'monobook':
@@ -132,8 +132,6 @@ wfLoadSkin( 'MinervaNeue' );
 wfLoadSkin( 'MonoBook' );
 wfLoadSkin( 'Timeless' );
 wfLoadSkin( 'Vector' );
-wfLoadExtension( 'VisualEditor' );
-wfLoadExtension( 'TemplateData' );
 
 
 # End of automatically generated settings.
