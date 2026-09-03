@@ -39,8 +39,8 @@ $wgResourceBasePath = $wgScriptPath;
 ## The URL paths to the logo.  Make sure you change this from the default,
 ## or else you'll overwrite your logo when you upgrade!
 $wgLogos = [
-	'1x' => "https://udomdejpedia.org/images/b/be/UP.png",
-	'icon' => "https://udomdejpedia.org/images/b/be/UP.png",
+	'1x' => "https://udomdejpedia.org/images/1/1c/UPlogo.png",
+	'icon' => "https://udomdejpedia.org/images/1/1c/UPlogo.png",
 ];
 
 ## UPO means: this is also a user preference option
@@ -134,6 +134,7 @@ wfLoadSkin( 'Timeless' );
 wfLoadSkin( 'Vector' );
 wfLoadExtension( 'VisualEditor' );
 wfLoadExtension( 'TemplateData' );
+wfLoadExtension( 'ParserFunctions' );
 
 
 # End of automatically generated settings.
