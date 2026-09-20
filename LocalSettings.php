@@ -135,6 +135,11 @@ wfLoadSkin( 'Vector' );
 wfLoadExtension( 'VisualEditor' );
 wfLoadExtension( 'TemplateData' );
 wfLoadExtension( 'ParserFunctions' );
+wfLoadExtension( 'TimedMediaHandler' );
+$wgFFmpegLocation = '/usr/bin/ffmpeg';
+wfLoadExtension( 'TextExtracts' );
+wfLoadExtension( 'PageImages' );
+wfLoadExtension( 'Popups' );
 
 
 # End of automatically generated settings.
