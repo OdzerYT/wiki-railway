@@ -1,0 +1,1113 @@
+<?php
+/**
+ * WebVideoTranscode provides:
+ *  encode keys
+ *  encode settings
+ *
+ * 	extends api to return all the streams
+ *  extends video tag output to provide all the available sources
+ */
+
+namespace MediaWiki\TimedMediaHandler\WebVideoTranscode;
+
+use Exception;
+use LogicException;
+use MediaWiki\Deferred\CdnCacheUpdate;
+use MediaWiki\Deferred\DeferredUpdates;
+use MediaWiki\FileRepo\File\File;
+use MediaWiki\FileRepo\IForeignRepoWithDB;
+use MediaWiki\FileRepo\IForeignRepoWithMWApi;
+use MediaWiki\JobQueue\Jobs\HTMLCacheUpdateJob;
+use MediaWiki\JobQueue\JobSpecification;
+use MediaWiki\MainConfigNames;
+use MediaWiki\MediaWikiServices;
+use MediaWiki\Status\Status;
+use MediaWiki\TimedMediaHandler\Handlers\FLACHandler\FLACHandler;
+use MediaWiki\TimedMediaHandler\Handlers\ID3Handler\ID3Handler;
+use MediaWiki\TimedMediaHandler\Handlers\MIDIHandler\MIDIHandler;
+use MediaWiki\TimedMediaHandler\Handlers\MP3Handler\MP3Handler;
+use MediaWiki\TimedMediaHandler\Handlers\MP4Handler\MP4Handler;
+use MediaWiki\TimedMediaHandler\Handlers\OggHandler\OggHandler;
+use MediaWiki\TimedMediaHandler\Handlers\WAVHandler\WAVHandler;
+use MediaWiki\TimedMediaHandler\HLS\Multivariant;
+use MediaWiki\Title\Title;
+use Wikimedia\FileBackend\FSFile\TempFSFile;
+use Wikimedia\FileBackend\FSFile\TempFSFileFactory;
+use Wikimedia\Rdbms\IReadableDatabase;
+
+/**
+ * Main WebVideoTranscode Class hold some constants and config values
+ */
+class WebVideoTranscode {
+	/**
+	 * File has a row in the transcode table but no known queue or transcoding activity.
+	 *
+	 * The file will not be automatically processed unless explicitly enqueued.
+	 */
+	public const STATE_MISSING = 0;
+
+	/**
+	 * File has been scheduled for transcoding but hasn't started processing.
+	 *
+	 * The transcode job is in the job queue waiting to be picked up by a job runner.
+	 */
+	public const STATE_QUEUED = 1;
+
+	/**
+	 * File is currently being processed by a job runner.
+	 *
+	 * Note: In some failure cases, this state might become stuck if the job runner
+	 * fails to properly update the status.
+	 */
+	public const STATE_ACTIVE = 2;
+
+	/**
+	 * Transcoding failed due to an error.
+	 *
+	 * The error details are recorded in the transcode_error field.
+	 * Requires manual intervention or explicit re-queue to retry.
+	 */
+	public const STATE_FAILED = 3;
+
+	/**
+	 * Transcoding completed successfully.
+	 *
+	 * The output file is available and published for use.
+	 */
+	public const STATE_SUCCESS = 4;
+
+	/** @var array[] Static cache of transcode state per instantiation */
+	public static $transcodeState = [];
+
+	private static ?TranscodePresets $transcodePresets = null;
+
+	private static function transcodePresets(): ?TranscodePresets {
+		// phpcs:ignore Generic.Files.LineLength.TooLong
+		self::$transcodePresets ??= MediaWikiServices::getInstance()->getService( 'TimedMediaHandler.TranscodePresets' );
+		return self::$transcodePresets;
+	}
+
+	/**
+	 * @param File $file
+	 * @param string $transcodeKey
+	 * @return string
+	 */
+	public static function getDerivativeFilePath( $file, $transcodeKey ) {
+		return $file->getTranscodedPath( static::getTranscodeFileBaseName( $file, $transcodeKey ) );
+	}
+
+	/**
+	 * Get the name to use as the base name for the transcode.
+	 *
+	 * Swift has problems where the url-encoded version of
+	 * the path (ie '0/00/filename.ogv/filename.ogv.720p.webm' )
+	 * is greater than > 1024 bytes, so shorten in that case.
+	 *
+	 * Future versions might respect FileRepo::$abbrvThreshold.
+	 *
+	 * @param File $file
+	 * @param string $suffix Optional suffix (e.g. transcode key).
+	 * @return string File name, or the string transcode.
+	 */
+	public static function getTranscodeFileBaseName( $file, $suffix = '' ) {
+		$name = $file->getName();
+		$length = strlen( urlencode( '0/00/' . $name . '/' . $name . '.' . $suffix ) );
+		if ( $length > 1024 ) {
+			return 'transcode' . '.' . $suffix;
+		}
+		return $name . '.' . $suffix;
+	}
+
+	/**
+	 * Get url for a transcode.
+	 *
+	 * @param File $file
+	 * @param string $suffix Transcode key
+	 * @return string
+	 */
+	public static function getTranscodedUrlForFile( $file, $suffix = '' ) {
+		return $file->getTranscodedUrl( static::getTranscodeFileBaseName( $file, $suffix ) );
+	}
+
+	/**
+	 * Get temp file at target path for video encode
+	 *
+	 * @return TempFSFile|null at target encode path
+	 */
+	public static function getTargetEncodeFile(
+		File $file,
+		string $transcodeKey,
+		string $suffix = ''
+	): ?TempFSFile {
+		$filePath = static::getDerivativeFilePath( $file, $transcodeKey ) . $suffix;
+		$ext = strtolower( pathinfo( $filePath, PATHINFO_EXTENSION ) );
+
+		// Create a temp FS file with the same extension
+		$tmpFileFactory = new TempFSFileFactory();
+		return $tmpFileFactory->newTempFSFile( 'transcode_' . $transcodeKey, $ext );
+	}
+
+	/**
+	 * Get the max size of the web stream ( constant bitrate )
+	 * @return int
+	 */
+	public static function getMaxSizeWebStream() {
+		$maxSize = 0;
+		foreach ( self::transcodePresets()->enabledVideoTranscodes() as $transcodeKey ) {
+			$settings = self::transcodePresets()->findByKey( $transcodeKey );
+			if ( $settings->videoBitrate ) {
+				$currentSize = $settings->maxSize;
+				if ( $currentSize > $maxSize ) {
+					$maxSize = $currentSize;
+				}
+			}
+		}
+		return $maxSize;
+	}
+
+	/**
+	 * Give a rough estimate on file size
+	 * Note this is not always accurate.. especially with variable bitrate codecs ;)
+	 * @param File $file
+	 * @param string $transcodeKey
+	 * @return int
+	 */
+	public static function getProjectedFileSize( $file, $transcodeKey ) {
+		$settings = self::transcodePresets()->findByKey( $transcodeKey );
+		// FIXME broken, as bitrate settings can contain units (64k)
+		if ( $settings->videoBitrate && $settings->audioBitrate ) {
+			return $file->getLength() * 8 * (
+				(int)$settings->videoBitrate
+				+
+				(int)$settings->audioBitrate
+			);
+		}
+		// Else just return the size of the source video
+		// ( we have no idea how large the actual derivative size will be )
+
+		/** @var ID3Handler $handler */
+		$handler = $file->getHandler();
+		'@phan-var ID3Handler $handler';
+		return $file->getLength() * $handler->getBitrate( $file ) * 8;
+	}
+
+	/**
+	 * Static function to get the set of video assets
+	 * Checks if the file is local or remote and grabs respective sources
+	 * @param File &$file
+	 * @param array $options
+	 * @return array|mixed
+	 */
+	public static function getSources( &$file, $options = [] ) {
+		if ( $file->isLocal() || $file->repo instanceof IForeignRepoWithDB ) {
+			return static::getLocalSources( $file, $options );
+		}
+
+		if ( $file->getRepo() instanceof IForeignRepoWithMWApi ) {
+			return static::getRemoteSources( $file, $options );
+		}
+
+		return [];
+	}
+
+	/**
+	 * Grabs sources from the remote repo via ApiQueryVideoInfo.php entry point.
+	 *
+	 * TODO: This method could use some rethinking. See comments on PS1 of
+	 * 	 <https://gerrit.wikimedia.org/r/#/c/117916/>
+	 *
+	 * Because this works with commons regardless of whether TimedMediaHandler is installed or not
+	 * @param File $file The File must belong to a repo that is an instance of IForeignRepoWithMWApi
+	 * @param array $options
+	 * @return array|mixed
+	 */
+	public static function getRemoteSources( $file, $options = [] ) {
+		$regenerator = static function () use ( $file, $options ) {
+			// Setup source attribute options
+			$dataPrefix = in_array( 'nodata', $options, true ) ? '' : 'data-';
+
+			wfDebug( "Get Video sources from remote api for " . $file->getName() . "\n" );
+			$namespaceInfo = MediaWikiServices::getInstance()->getNamespaceInfo();
+			$query = [
+				'action' => 'query',
+				'prop' => 'videoinfo',
+				'viprop' => 'derivatives',
+				'titles' => $namespaceInfo->getCanonicalName( NS_FILE ) . ':' . $file->getTitle()->getText()
+			];
+
+			/** @var IForeignRepoWithMWApi $repo */
+			$repo = $file->getRepo();
+			'@phan-var IForeignRepoWithMWApi $repo';
+			$data = $repo->fetchImageQuery( $query );
+
+			if ( isset( $data['warnings']['query'] ) &&
+				$data['warnings']['query']['*'] === "Unrecognized value for parameter 'prop': videoinfo"
+			) {
+				// The target wiki doesn't have TimedMediaHandler.
+				// Use the normal file repo system single source:
+				return [ static::getPrimarySourceAttributes( $file, [ $dataPrefix ] ) ];
+			}
+
+			$sources = [];
+			// Generate the source list from the data response:
+			if ( isset( $data['query']['pages'] ) ) {
+				$vidResult = array_shift( $data['query']['pages'] );
+				if ( isset( $vidResult['videoinfo'] ) ) {
+					$derResult = array_shift( $vidResult['videoinfo'] );
+					$derivatives = $derResult['derivatives'];
+					foreach ( $derivatives as $derivativeSource ) {
+						$sources[] = $derivativeSource;
+					}
+				}
+			}
+
+			return $sources;
+		};
+
+		$repoInfo = $file->getRepo()->getInfo();
+		$cacheTTL = $repoInfo['descriptionCacheExpiry'] ?? 0;
+
+		if ( $cacheTTL > 0 ) {
+			$cache = MediaWikiServices::getInstance()->getMainWANObjectCache();
+			$sources = $cache->getWithSetCallback(
+				$cache->makeKey( 'WebVideoSources-url', $file->getRepoName(), $file->getName() ),
+				$cacheTTL,
+				$regenerator
+			);
+		} else {
+			$sources = $regenerator();
+		}
+
+		return $sources;
+	}
+
+	/**
+	 * Based on the $wgEnabledTranscodeSet set of enabled derivatives we
+	 * return sources that are ready.
+	 *
+	 * This will not automatically update or queue anything!
+	 *
+	 * @param File &$file File object
+	 * @param array $options Options, a set of options:
+	 * 		'nodata' Strips the data- attribute, useful when your output is not html
+	 * @return array an associative array of sources suitable for <source> tag output
+	 */
+	public static function getLocalSources( &$file, $options = [] ) {
+		$sources = [];
+
+		// Add the original file:
+		$sources[] = static::getPrimarySourceAttributes( $file, $options );
+
+		// If $wgEnableTranscode is false don't look for or add other local sources:
+		if ( MediaWikiServices::getInstance()->getMainConfig()->get( 'EnableTranscode' ) === false &&
+			!( $file->repo instanceof IForeignRepoWithDB ) ) {
+			return $sources;
+		}
+
+		// If an "oldFile" don't look for other sources:
+		if ( $file->isOld() ) {
+			return $sources;
+		}
+
+		/** @var ID3Handler $handler */
+		$handler = $file->getHandler();
+		'@phan-var ID3Handler $handler';
+		// Now Check for derivatives
+		if ( $handler->isAudio( $file ) ) {
+			$transcodeSet = self::transcodePresets()->enabledAudioTranscodes();
+		} else {
+			$transcodeSet = self::transcodePresets()->enabledVideoTranscodes();
+		}
+
+		$lastHLS = null;
+		foreach ( $transcodeSet as $transcodeKey ) {
+			if ( static::isTranscodeKeyPlayable( $transcodeKey ) &&
+				 static::isTranscodeEnabled( $file, $transcodeKey )
+			) {
+				// Try and add the source
+				static::addSourceIfReady( $file, $sources, $transcodeKey, $options );
+			}
+			$settings = self::transcodePresets()->findByKey( $transcodeKey );
+			if ( $settings->streaming === 'hls' && static::isTranscodeReady( $file, $transcodeKey ) ) {
+				$lastHLS = $transcodeKey;
+			}
+		}
+		if ( $lastHLS ) {
+			$src = static::getTranscodedUrlForFile( $file, 'm3u8' );
+			$settings = self::transcodePresets()->findByKey( $lastHLS );
+			[ $width, $height ] = static::getMaxSizeTransform(
+				$file,
+				$settings->maxSize ?? (
+					implode( 'x', [
+						$settings->width ?? '0',
+						$settings->height ?? '0',
+					] )
+				)
+			);
+			$sources[] = [
+				'src' => $src,
+				'title' => wfMessage( 'timedmedia-derivative-desc-m3u8' )->text(),
+				'type' => 'application/vnd.apple.mpegurl',
+				'shorttitle' => wfMessage( 'timedmedia-derivative-desc-m3u8' )->text(),
+				'transcodekey' => 'm3u8',
+				'width' => $width,
+				'height' => $height,
+			];
+		}
+
+		return $sources;
+	}
+
+	/**
+	 * Does this transcode key represent a directly-playable type?
+	 * If not it's a backing track for adaptive streaming, and should
+	 * not be exposed directly as a downloadable/playable derivative.
+	 *
+	 * @param string $transcodeKey
+	 * @return bool
+	 */
+	public static function isTranscodeKeyPlayable( $transcodeKey ) {
+		$settings = self::transcodePresets()->findByKey( $transcodeKey );
+		if ( !$settings ) {
+			return false;
+		}
+		return !$settings->streaming;
+	}
+
+	/**
+	 * Get the transcode state for a given filename and transcodeKey
+	 *
+	 * @param File $file
+	 * @param string $transcodeKey
+	 * @return bool
+	 */
+	public static function isTranscodeReady( $file, $transcodeKey ) {
+		// Check if we need to populate the transcodeState cache:
+		$transcodeState = static::getTranscodeState( $file );
+
+		// If no state is found the cache for this file is false:
+		if ( !isset( $transcodeState[ $transcodeKey ] ) ) {
+			return false;
+		}
+		// Else return boolean ready state ( if not null, then ready ):
+		return ( $transcodeState[ $transcodeKey ]['time_success'] ) !== null;
+	}
+
+	/**
+	 * Clear the transcode state cache:
+	 * @param string|null $fileName Optional fileName to clear transcode cache for
+	 */
+	public static function clearTranscodeCache( $fileName = null ) {
+		if ( $fileName ) {
+			unset( static::$transcodeState[ $fileName ] );
+		} else {
+			static::$transcodeState = [];
+		}
+	}
+
+	/**
+	 * Populates the transcode table with the current DB state of transcodes
+	 * if transcodes are not found in the database their state is set to "false"
+	 *
+	 * @param File $file File object
+	 * @param IReadableDatabase|false $db
+	 * @return array[]
+	 */
+	public static function getTranscodeState( $file, $db = false ) {
+		$fileName = $file->getName();
+		if ( $db || !isset( static::$transcodeState[$fileName] ) ) {
+			if ( $db === false ) {
+				$db = $file->repo->getReplicaDB();
+			}
+			// initialize the transcode state array
+			static::$transcodeState[ $fileName ] = [];
+			$res = $db->newSelectQueryBuilder()
+				->select( '*' )
+				->from( 'transcode' )
+				->where( [ 'transcode_image_name' => $fileName ] )
+				->limit( 100 )
+				->caller( __METHOD__ )
+				->fetchResultSet();
+
+			// Populate the per transcode state cache
+			foreach ( $res as $row ) {
+				// strip the out the "transcode_" from keys
+				$transcodeState = [];
+				foreach ( $row as $k => $v ) {
+					$transcodeState[ str_replace( 'transcode_', '', $k ) ] = $v;
+				}
+				static::$transcodeState[ $fileName ][ $row->transcode_key ] = $transcodeState;
+			}
+		}
+		$sorted = static::$transcodeState[ $fileName ];
+		uksort( $sorted, 'strnatcmp' );
+		return $sorted;
+	}
+
+	/**
+	 * Remove any transcode files and db states associated with a given $file
+	 * Note that if you want to see them again, you must re-queue them by calling
+	 * startJobQueue() or updateJobQueue().
+	 *
+	 * also remove the transcode files:
+	 * @param File $file File Object
+	 * @param string|false $transcodeKey Optional transcode key to remove only this key
+	 */
+	public static function removeTranscodes( $file, $transcodeKey = false ) {
+		// if transcode key is non-false, non-null:
+		if ( $transcodeKey ) {
+			// only remove the requested $transcodeKey
+			$removeKeys = [ $transcodeKey ];
+		} else {
+			// Remove any existing files ( regardless of their state )
+			$res = $file->repo->getPrimaryDB()->newSelectQueryBuilder()
+				->select( 'transcode_key' )
+				->from( 'transcode' )
+				->where( [ 'transcode_image_name' => $file->getName() ] )
+				->caller( __METHOD__ )
+				->fetchResultSet();
+
+			$removeKeys = [];
+			foreach ( $res as $transcodeRow ) {
+				$removeKeys[] = $transcodeRow->transcode_key;
+			}
+		}
+
+		// Remove files by key:
+		$urlsToPurge = [];
+		$filesToPurge = [];
+		$hasHLS = false;
+		foreach ( $removeKeys as $tKey ) {
+			$urlPath = static::getTranscodedUrlForFile( $file, $tKey );
+			$filePath = static::getDerivativeFilePath( $file, $tKey );
+			$urlsToPurge[] = $urlPath;
+			$filesToPurge[] = $filePath;
+
+			$options = self::transcodePresets()->findByKey( $tKey );
+			if ( $options && $options->streaming === 'hls' ) {
+				$urlsToPurge[] = $urlPath . '.m3u8';
+				$filesToPurge[] = $filePath . '.m3u8';
+				$hasHLS = true;
+			}
+		}
+		if ( $hasHLS && $transcodeKey === false ) {
+			// Delete all derivatives including the main hls manifest
+			$urlsToPurge[] = static::getTranscodedUrlForFile( $file, 'm3u8' );
+			$filesToPurge[] = static::getDerivativeFilePath( $file, 'm3u8' );
+		}
+		foreach ( $filesToPurge as $filePath ) {
+			if ( $file->repo->fileExists( $filePath ) ) {
+				$res = $file->repo->quickPurge( $filePath );
+				if ( !$res ) {
+					wfDebug( "Could not delete file $filePath\n" );
+				}
+			}
+		}
+
+		$update = new CdnCacheUpdate( $urlsToPurge );
+		DeferredUpdates::addUpdate( $update );
+
+		// Build the sql query:
+		$queryBuilder = $file->repo->getPrimaryDB()->newDeleteQueryBuilder()
+			->deleteFrom( 'transcode' )
+			->where( [ 'transcode_image_name' => $file->getName() ] );
+		// Check if we are removing a specific transcode key
+		if ( $transcodeKey !== false ) {
+			$queryBuilder->andWhere( [ 'transcode_key' => $transcodeKey ] );
+		}
+		// Remove the db entries
+		$queryBuilder->caller( __METHOD__ )->execute();
+
+		// Purge the cache for pages that include this video:
+		$titleObj = $file->getTitle();
+		static::invalidatePagesWithFile( $titleObj );
+
+		// Remove from local WebVideoTranscode cache:
+		static::clearTranscodeCache( $titleObj->getDBkey() );
+		if ( $transcodeKey !== false ) {
+			// We only removed a single transcode, so we need to update the manifests
+			static::updateStreamingManifests( $file );
+		}
+	}
+
+	/**
+	 * @param Title $titleObj
+	 */
+	public static function invalidatePagesWithFile( $titleObj ) {
+		wfDebug( "WebVideoTranscode:: Invalidate pages that include: " . $titleObj->getDBkey() . "\n" );
+		// Purge the main image page:
+		$titleObj->invalidateCache();
+
+		// Invalidate cache for all pages using this file
+		$cacheUpdateJob = HTMLCacheUpdateJob::newForBacklinks(
+			$titleObj,
+			'imagelinks',
+			// TODO add 'causeAgent' => $user->getName()
+			// and more accurate action
+			[ 'causeAction' => 'tmh-transcode-update' ]
+		);
+		MediaWikiServices::getInstance()->getJobQueueGroup()->lazyPush( $cacheUpdateJob );
+
+		// TODO GlobalUsage
+	}
+
+	/**
+	 * Add a source to the sources list if the transcode job is ready
+	 *
+	 * If the source is not found, it will not be used yet...
+	 * Missing transcodes should be added by write tasks, not read tasks!
+	 * @param File $file
+	 * @param array &$sources
+	 * @param string $transcodeKey
+	 * @param array $dataPrefix
+	 */
+	public static function addSourceIfReady( $file, &$sources, $transcodeKey, $dataPrefix ) {
+		// Check if the transcode is ready:
+		if ( static::isTranscodeReady( $file, $transcodeKey ) ) {
+			$sources[] = static::getDerivativeSourceAttributes( $file, $transcodeKey, $dataPrefix );
+		}
+	}
+
+	/**
+	 * Get the primary "source" asset used for other derivatives
+	 * @param File $file
+	 * @param array $options
+	 * @return array
+	 */
+	public static function getPrimarySourceAttributes( $file, $options = [] ) {
+		$src = in_array( 'fullurl', $options, true ) ?
+			MediaWikiServices::getInstance()->getUrlUtils()->expand( $file->getUrl() ) :
+			$file->getUrl();
+
+		/** @var FLACHandler|MIDIHandler|MP3Handler|MP4Handler|OggHandler|WAVHandler $handler */
+		$handler = $file->getHandler();
+		'@phan-var FLACHandler|MIDIHandler|MP3Handler|MP4Handler|OggHandler|WAVHandler $handler';
+		$bitrate = $handler->getBitrate( $file );
+
+		$source = [
+			'src' => $src,
+			'type' => $handler->getWebType( $file ),
+			'width' => (int)$file->getWidth(),
+			'height' => (int)$file->getHeight(),
+		];
+
+		if ( $bitrate ) {
+			$source["bandwidth"] = round( $bitrate );
+		}
+		return $source;
+	}
+
+	/**
+	 * Get derivative "source" attributes
+	 * @param File $file
+	 * @param string $transcodeKey
+	 * @param array $options
+	 * @return array
+	 */
+	public static function getDerivativeSourceAttributes( $file, $transcodeKey, $options = [] ) {
+		$fileName = $file->getTitle()->getDBkey();
+
+		$src = static::getTranscodedUrlForFile( $file, $transcodeKey );
+
+		/** @var ID3Handler $handler */
+		$handler = $file->getHandler();
+		'@phan-var ID3Handler $handler';
+		if ( $handler->isAudio( $file ) ) {
+			$width = $height = 0;
+		} else {
+			[ $width, $height ] = static::getMaxSizeTransform(
+				$file,
+				self::transcodePresets()->findByKey( $transcodeKey )->maxSize
+			);
+		}
+
+		// Setup the url src:
+		$src = in_array( 'fullurl', $options, true ) ?
+			MediaWikiServices::getInstance()->getUrlUtils()->expand( $src ) :
+			$src;
+		$fields = [
+			'src' => $src,
+			'type' => self::transcodePresets()->findByKey( $transcodeKey )->type,
+			'transcodekey' => $transcodeKey,
+
+			// Add data attributes per emerging DASH / webTV adaptive streaming attributes
+			// eventually we will define a manifest xml entry point.
+			"width" => (int)$width,
+			"height" => (int)$height,
+		];
+
+		// a "ready" transcode should have a bitrate:
+		if ( isset( static::$transcodeState[$fileName] ) ) {
+			$fields["bandwidth"] = (int)static::$transcodeState[$fileName][$transcodeKey]['final_bitrate'];
+		}
+		return $fields;
+	}
+
+	/**
+	 * Queue up all enabled transcodes if missing.
+	 * @param File $file File object
+	 */
+	public static function startJobQueue( File $file ) {
+		$keys = self::transcodePresets()->enabledTranscodes();
+
+		// 'Natural sort' puts the transcodes in ascending order by resolution,
+		// which roughly gives us fastest-to-slowest order.
+		natsort( $keys );
+
+		foreach ( $keys as $tKey ) {
+			// Note the job queue will de-duplicate and handle various errors, so we
+			// can just blast out the full list here.
+			static::updateJobQueue( $file, $tKey );
+		}
+	}
+
+	/**
+	 * Regenerate the streaming manifests, currently the HLS multivariant playlist,
+	 * to refer to available completed transcodes. If there are no available
+	 * compatible transcodes the playlist will be written out empty.
+	 *
+	 * Simultaneous attempts to overwrite will result in whichever commits to
+	 * the filesystem or other backend last "winning". Locks in the database
+	 * have been known to cause production problems, and a more thorough queueing
+	 * system might be wise to look into later.
+	 *
+	 * @param File $file base file to check for transcodes on
+	 */
+	public static function updateStreamingManifests( File $file ): Status {
+		$fileName = $file->getTitle()->getDBkey();
+		$repo = $file->getRepo();
+		if ( !is_a( $repo, 'LocalRepo' ) ) {
+			return Status::newGood();
+		}
+		$dbw = $repo->getPrimaryDB();
+
+		// Note that trying to use a database lock here plays hell with many
+		// many scenarios in production, it seems, especially when deleting
+		// files.
+		//
+		// See [T348689](https://phabricator.wikimedia.org/T348689) etc.
+		//
+		// To in future: serialize these updates through the job queue
+		// or something else *clever* and non-destructive in terms of wait
+		// states.
+
+		static::clearTranscodeCache( $fileName );
+
+		// Currently only HLS streaming is output.
+		$m3u8 = "$fileName.m3u8";
+		$keys = [];
+		foreach ( self::transcodePresets()->allPresets() as $key => $settings ) {
+			if ( $settings->streaming === 'hls' && static::isTranscodeReady( $file, $key ) ) {
+				$keys[] = $key;
+			}
+		}
+		// @todo look up the frame rate and final bitrates and use those
+		$multivariant = new Multivariant( $fileName, $keys );
+		$playlist = $multivariant->playlist();
+
+		$tmpFileFactory = new TempFSFileFactory();
+		$tmpFile = $tmpFileFactory->newTempFSFile( $m3u8, 'm3u8' );
+		if ( !$tmpFile ) {
+			return Status::newFatal( 'm3u8-error-create-temp', $m3u8 );
+		}
+		$result = file_put_contents( $tmpFile->getPath(), $playlist );
+		if ( $result === false ) {
+			return Status::newFatal( 'm3u8-error-write-temp', $m3u8 );
+		}
+
+		$result = $repo->quickImport(
+			$tmpFile,
+			$file->getTranscodedPath( $m3u8 )
+		);
+		return $result;
+	}
+
+	/**
+	 * Make sure all relevant transcodes for the given file are tracked in the
+	 * transcodes table; add entries for any missing ones.
+	 *
+	 * @param File $file File object
+	 */
+	public static function cleanupTranscodes( File $file ) {
+		$fileName = $file->getTitle()->getDBkey();
+		$dbw = $file->repo->getPrimaryDB();
+
+		$transcodeState = static::getTranscodeState( $file, $dbw );
+
+		$keys = self::transcodePresets()->enabledTranscodes();
+		foreach ( $keys as $transcodeKey ) {
+			if ( !static::isTranscodeEnabled( $file, $transcodeKey ) ) {
+				// This transcode is no longer enabled or erroneously included...
+				// Leave it in place, allowing it to be removed manually;
+				// it won't be used in playback and should be doing no harm.
+				continue;
+			}
+			if ( !isset( $transcodeState[ $transcodeKey ] ) ) {
+				$dbw->newInsertQueryBuilder()
+					->insertInto( 'transcode' )
+					->ignore()
+					->row( [
+						'transcode_image_name' => $fileName,
+						'transcode_key' => $transcodeKey,
+						'transcode_error' => '',
+						'transcode_final_bitrate' => 0,
+						// Do not start transcode jobs automatically, as purging is too common.
+						'transcode_state' => self::STATE_MISSING,
+						'transcode_touched' => $dbw->timestamp(),
+						'transcode_size' => null,
+					] )
+					->caller( __METHOD__ )->execute();
+			}
+		}
+
+		// Remove from local WebVideoTranscode cache:
+		static::clearTranscodeCache( $fileName );
+	}
+
+	/**
+	 * Check if the given transcode key is appropriate for the file.
+	 *
+	 * @param File $file File object
+	 * @param string $transcodeKey transcode key
+	 * @return bool
+	 */
+	public static function isTranscodeEnabled( File $file, $transcodeKey ) {
+		/** @var FLACHandler|MIDIHandler|MP3Handler|MP4Handler|OggHandler|WAVHandler $handler */
+		$handler = $file->getHandler();
+		'@phan-var FLACHandler|MIDIHandler|MP3Handler|MP4Handler|OggHandler|WAVHandler $handler';
+		$audio = $handler->isAudio( $file );
+		if ( $audio ) {
+			$keys = self::transcodePresets()->enabledAudioTranscodes();
+		} else {
+			$keys = self::transcodePresets()->enabledVideoTranscodes();
+		}
+
+		if ( in_array( $transcodeKey, $keys, true ) ) {
+			$settings = self::transcodePresets()->findByKey( $transcodeKey );
+			if ( $audio ) {
+				$sourceCodecs = $handler->getStreamTypes( $file );
+				$sourceCodec = $sourceCodecs ? strtolower( $sourceCodecs[0] ) : '';
+				return ( $sourceCodec !== $settings->audioCodec );
+			}
+			if ( $settings->streaming && $settings->novideo ) {
+				// Streaming audio should be generated for all formats
+				// if audio is present on the file, and for none if not.
+				return $handler->hasAudio( $file );
+			}
+			if ( static::isTargetLargerThanFile( $file, $settings->maxSize ?? '' ) ) {
+				// Are we the smallest enabled transcode for this type?
+				// Then go ahead and make a wee little transcode for compat.
+				return static::isSmallestTranscodeForCodec( $transcodeKey );
+			}
+			return true;
+		}
+		// Transcode key is invalid or has been disabled.
+		return false;
+	}
+
+	/**
+	 * Update the job queue if the file is not already in the job queue:
+	 * @param File $file File object
+	 * @param ?string $transcodeKey transcode key
+	 * @param array $options array with 'manualOverride' or 'remux' boolean options
+	 */
+	public static function updateJobQueue( $file, ?string $transcodeKey, array $options = [] ) {
+		$fileName = $file->getTitle()->getDBkey();
+		$dbw = $file->repo->getPrimaryDB();
+
+		if ( $transcodeKey === null ) {
+			$enabledTranscodes = static::transcodePresets()->enabledVideoTranscodes();
+			foreach ( $enabledTranscodes as $key ) {
+				static::updateJobQueue( $file, $key, $options );
+			}
+			return;
+		}
+
+		if ( !static::isTranscodeEnabled( $file, $transcodeKey ) ) {
+			return;
+		}
+
+		// If the transcode entry hasn't been added yet, attempt to do so
+		$dbw->newInsertQueryBuilder()
+			->insertInto( 'transcode' )
+			->ignore()
+			->row( [
+				'transcode_image_name' => $fileName,
+				'transcode_key' => $transcodeKey,
+				'transcode_error' => '',
+				'transcode_final_bitrate' => 0,
+				'transcode_state' => self::STATE_QUEUED,
+				'transcode_touched' => $dbw->timestamp(),
+			] )
+			->onDuplicateKeyUpdate()
+			->uniqueIndexFields( [
+				'transcode_image_name',
+				'transcode_key',
+			] )
+			->set( [
+				'transcode_error' => '',
+				'transcode_final_bitrate' => 0,
+				'transcode_state' => self::STATE_QUEUED,
+				'transcode_touched' => $dbw->timestamp(),
+			] )
+			->caller( __METHOD__ )->execute();
+
+		if ( $dbw->affectedRows() ) {
+			// Set the priority
+			$prioritized = static::isTranscodePrioritized( $file, $transcodeKey );
+
+			$job = new JobSpecification( $prioritized ? 'webVideoTranscodePrioritized' : 'webVideoTranscode', [
+				'transcodeMode' => 'derivative',
+				'transcodeKey' => $transcodeKey,
+				'prioritized' => $prioritized,
+				'manualOverride' => $options['manualOverride'] ?? false,
+				'remux' => $options['remux'] ?? false,
+			], [], $file->getTitle() );
+
+			try {
+				MediaWikiServices::getInstance()->getJobQueueGroupFactory()->makeJobQueueGroup()->push( $job );
+				// Clear the state cache ( now that we have updated the page )
+				static::clearTranscodeCache( $fileName );
+			} catch ( Exception ) {
+				// Adding job failed, update transcode row
+				$dbw->newUpdateQueryBuilder()
+					->update( 'transcode' )
+					->set( [
+						'transcode_error' => "Failed to insert Job.",
+						'transcode_state' => self::STATE_FAILED,
+						'transcode_touched' => $dbw->timestamp(),
+					] )
+					->where( [
+						'transcode_image_name' => $fileName,
+						'transcode_key' => $transcodeKey,
+					] )
+					->caller( __METHOD__ )
+					->execute();
+			}
+		}
+	}
+
+	/**
+	 * Check if this transcode belongs to the high-priority queue.
+	 * @param File $file
+	 * @param string $transcodeKey
+	 * @return bool
+	 */
+	public static function isTranscodePrioritized( File $file, $transcodeKey ) {
+		$transcodeHeight = 0;
+		$matches = [];
+		if ( preg_match( '/^(\d+)p/', $transcodeKey, $matches ) ) {
+			$transcodeHeight = (int)$matches[0];
+		}
+		$config = MediaWikiServices::getInstance()->getMainConfig();
+		return ( $transcodeHeight <= $config->get( 'TmhPriorityResolutionThreshold' ) )
+			&& ( $file->getLength() <= $config->get( 'TmhPriorityLengthThreshold' ) );
+	}
+
+	/**
+	 * Return job queue length for the queue that will run this transcode.
+	 * @param File $file
+	 * @param string $transcodeKey
+	 * @return int
+	 */
+	public static function getQueueSize( File $file, $transcodeKey ) {
+		// Warning: this won't treat the prioritized queue separately.
+		$db = $file->repo->getPrimaryDB();
+		return $db->newSelectQueryBuilder()
+			->from( 'transcode' )
+			->where( [
+				'transcode_state' => self::STATE_QUEUED,
+			] )
+			->caller( __METHOD__ )
+			->fetchRowCount();
+	}
+
+	/**
+	 * Transforms the size per a given "maxSize"
+	 *  if maxSize is > file, file size is used
+	 * @param File $file
+	 * @param string $targetMaxSize
+	 * @return int[]
+	 */
+	public static function getMaxSizeTransform( $file, $targetMaxSize ) {
+		$maxSize = static::getMaxSize( $targetMaxSize );
+		$sourceWidth = (int)$file->getWidth();
+		$sourceHeight = (int)$file->getHeight();
+		if ( $sourceHeight === 0 ) {
+			// Audio file
+			return [ 0, 0 ];
+		}
+		$sourceAspect = $sourceWidth / $sourceHeight;
+		$targetWidth = $sourceWidth;
+		$targetHeight = $sourceHeight;
+		if ( $sourceAspect <= $maxSize['aspect'] ) {
+			if ( $sourceHeight > $maxSize['height'] ) {
+				$targetHeight = $maxSize['height'];
+				$targetWidth = (int)( $targetHeight * $sourceAspect );
+			}
+		} else {
+			if ( $sourceWidth > $maxSize['width'] ) {
+				$targetWidth = $maxSize['width'];
+				$targetHeight = (int)( $targetWidth / $sourceAspect );
+				// some players do not like uneven frame sizes
+			}
+		}
+		// some players do not like uneven frame sizes
+		$targetWidth += $targetWidth % 2;
+		$targetHeight += $targetHeight % 2;
+		return [ $targetWidth, $targetHeight ];
+	}
+
+	/**
+	 * Test if a given transcode target is larger than the source file
+	 *
+	 * @param File &$file File object
+	 * @param string $targetMaxSize
+	 * @return bool
+	 */
+	public static function isTargetLargerThanFile( &$file, $targetMaxSize ) {
+		$maxSize = static::getMaxSize( $targetMaxSize );
+		$sourceWidth = $file->getWidth();
+		$sourceHeight = $file->getHeight();
+		$sourceAspect = (int)$sourceWidth / (int)$sourceHeight;
+		if ( $sourceAspect <= $maxSize['aspect'] ) {
+			return ( $maxSize['height'] > $sourceHeight );
+		}
+		return ( $maxSize['width'] > $sourceWidth );
+	}
+
+	/**
+	 * Is the given transcode key the smallest configured transcode for
+	 * its video codec?
+	 * @param string $transcodeKey
+	 * @return bool
+	 */
+	public static function isSmallestTranscodeForCodec( $transcodeKey ) {
+		$settings = self::transcodePresets()->findByKey( $transcodeKey );
+		$vcodec = $settings->videoCodec;
+		$maxSize = static::getMaxSize( $settings->maxSize );
+
+		foreach ( self::transcodePresets()->enabledVideoTranscodes() as $tKey ) {
+			$tsettings = self::transcodePresets()->findByKey( $tKey );
+			if ( $tsettings->novideo ) {
+				// This is an audio track for a video streaming set.
+				// Always generate it.
+				return true;
+			}
+			if ( $tsettings->videoCodec === $vcodec ) {
+				$tmaxSize = static::getMaxSize( $tsettings->maxSize );
+				if ( $tmaxSize['width'] < $maxSize['width'] ) {
+					return false;
+				}
+				if ( $tmaxSize['height'] < $maxSize['height'] ) {
+					return false;
+				}
+			}
+		}
+
+		return true;
+	}
+
+	/**
+	 * Return maxSize array for given maxSize setting
+	 *
+	 * @param string $targetMaxSize
+	 * @return array
+	 */
+	public static function getMaxSize( $targetMaxSize ) {
+		$maxSize = [];
+		$targetMaxSize = explode( 'x', $targetMaxSize, 2 );
+		$maxSize['width'] = (int)$targetMaxSize[0];
+		if ( count( $targetMaxSize ) === 1 ) {
+			$maxSize['height'] = (int)$targetMaxSize[0];
+		} else {
+			$maxSize['height'] = (int)$targetMaxSize[1];
+		}
+		// check for zero size ( audio )
+		if ( $maxSize['width'] === 0 || $maxSize['height'] === 0 ) {
+			$maxSize['aspect'] = 0;
+		} else {
+			$maxSize['aspect'] = $maxSize['width'] / $maxSize['height'];
+		}
+		return $maxSize;
+	}
+
+	public static function isBaseMediaFormat( string $extension ): bool {
+		$isos = [ 'mp4', 'm4v', 'm4a', 'mov', '3gp' ];
+		return in_array( $extension, $isos );
+	}
+
+	/**
+	 * Expand a bitrate that may have a k/m/g suffix
+	 *
+	 * @param string|int $rate
+	 * @return int
+	 */
+	public static function expandRate( $rate ) {
+		if ( is_int( $rate ) ) {
+			return $rate;
+		}
+		$matches = [];
+		if ( preg_match( '/^(\d+)([kmg])$/', strtolower( $rate ), $matches ) ) {
+			$n = (int)$matches[1];
+			switch ( $matches[2] ) {
+				case 'g':
+					$n *= 1000;
+					// fall through
+				case 'm':
+					$n *= 1000;
+					// fall through
+				case 'k':
+					$n *= 1000;
+					break;
+				default:
+					throw new LogicException( "Unexpected size suffix: " . $matches[2] );
+			}
+			return $n;
+		} else {
+			return (int)$rate;
+		}
+	}
+
+	/**
+	 * Remove stray transcode table entries that no longer refer to a living
+	 * file. Note this does not remove the backing files, if any.
+	 *
+	 * @param int $batchSize max number of rows to clean in this batch
+	 * @return int number of rows deleted
+	 */
+	public static function cleanupOrphanedTranscodes( int $batchSize ): int {
+		$lbFactory = MediaWikiServices::getInstance()->getDBLoadBalancerFactory();
+		$migrationStage = MediaWikiServices::getInstance()->getMainConfig()->get(
+			MainConfigNames::FileSchemaMigrationStage
+		);
+		$dbw = $lbFactory->getPrimaryDatabase();
+		$ticket = $lbFactory->getEmptyTransactionTicket( __METHOD__ );
+		$queryBuilder = $dbw->newSelectQueryBuilder()
+			->select( 'transcode_id' )
+			->from( 'transcode' )
+			->limit( $batchSize );
+
+		if ( $migrationStage & SCHEMA_COMPAT_READ_OLD ) {
+			$queryBuilder->leftJoin( 'image', null, [ 'img_name = transcode_image_name' ] )
+				->where( [ 'img_name' => null ] );
+		} else {
+			$queryBuilder->leftJoin( 'file', null, [ 'file_name = transcode_image_name' ] )
+				->where(
+					$dbw->expr( 'file_name', '=', null )
+						->or( 'file_deleted', '!=', 0 )
+				);
+		}
+
+		$ids = $queryBuilder->caller( __METHOD__ )->fetchFieldValues();
+		if ( count( $ids ) > 0 ) {
+			$dbw->newDeleteQueryBuilder()
+				->delete( 'transcode' )
+				->where( [ 'transcode_id' => $ids ] )
+				->caller( __METHOD__ )
+				->execute();
+		}
+		$lbFactory->commitAndWaitForReplication( __METHOD__, $ticket );
+		return count( $ids );
+	}
+}
