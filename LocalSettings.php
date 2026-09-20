@@ -145,3 +145,6 @@ $wgFFmpegLocation = '/usr/bin/ffmpeg';
 # End of automatically generated settings.
 # Add more configuration options below.
 
+
+$wgTmhEnableMp4Uploads = true;
+$wgMaxUploadSize = 20 * 1024 * 1024;
