@@ -136,10 +136,10 @@ wfLoadExtension( 'VisualEditor' );
 wfLoadExtension( 'TemplateData' );
 wfLoadExtension( 'ParserFunctions' );
 wfLoadExtension( 'TimedMediaHandler' );
-$wgFFmpegLocation = '/usr/bin/ffmpeg';
 wfLoadExtension( 'TextExtracts' );
 wfLoadExtension( 'PageImages' );
 wfLoadExtension( 'Popups' );
+$wgFFmpegLocation = '/usr/bin/ffmpeg';
 
 
 # End of automatically generated settings.
